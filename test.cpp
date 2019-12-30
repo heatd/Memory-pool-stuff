@@ -250,6 +250,7 @@ private:
 int main(int argc, char **)
 {
 	memory_pool<object> pool;
+	/* TODO: Why is pool going out of scope */
 	std::vector<object *> vec;
 
 	for(int i = 0; i < 10000; i++)
