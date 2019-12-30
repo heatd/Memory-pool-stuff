@@ -251,6 +251,7 @@ int main(int argc, char **)
 {
 	memory_pool<object> pool;
 	/* TODO: Why is pool going out of scope */
+	/* TODO: Add support for buffers bigger than 2 * PAGE_SIZE and adjust segment size dynamically */
 	std::vector<object *> vec;
 
 	for(int i = 0; i < 10000; i++)
