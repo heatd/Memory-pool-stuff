@@ -6,6 +6,12 @@
 #include <cassert>
 #include <utility>
 
+
+#define OBJECT_POOL_ALLOCATE_WARM_CACHE
+#define OBJECT_CANARY				0xcacacacacacacaca
+#undef OBJECT_CANARY
+#undef OBJECT_POOL_DEFER_UNMAP
+
 static constexpr size_t object_pool_alignment = 16UL;
 
 template <typename T>
@@ -23,6 +29,10 @@ struct memory_chunk
 {
 	struct memory_chunk *next;
 	memory_pool_segment<T> *segment;
+#ifdef OBJECT_CANARY
+	unsigned long object_canary;
+	unsigned long pad0;
+#endif
 	/* Note that this is 16-byte aligned */
 } __attribute__((packed));
 
@@ -34,8 +44,10 @@ private:
 	size_t size;
 public:
 	size_t used_objs;
+	memory_pool_segment<T> *prev, *next;
 
-	memory_pool_segment(void *mmap_segment, size_t size) : mmap_segment{mmap_segment}, size{size}, used_objs{} {}
+	memory_pool_segment(void *mmap_segment, size_t size) : mmap_segment{mmap_segment}, size{size}, used_objs{},
+								prev{nullptr}, next{nullptr} {}
 	~memory_pool_segment()
 	{
 		/* If mmap_segment is null, it's an empty object(has been std::move'd) */
@@ -78,30 +90,51 @@ public:
 		return *this;
 	}
 
-	static constexpr size_t memory_pool_size()
+	static constexpr bool is_large_object()
 	{
-		return 2 * PAGE_SIZE;
+		return sizeof(T) >= PAGE_SIZE / 8;
 	}
+	
+	static constexpr size_t default_pool_size = 2 * PAGE_SIZE;
 
-	constexpr size_t size_of_chunk()
+	static constexpr size_t size_of_chunk()
 	{
 		return align_up(sizeof(T), object_pool_alignment) + sizeof(memory_chunk<T>);
 	}
 
+	static constexpr size_t size_of_inline_segment()
+	{
+		return align_up(sizeof(memory_pool_segment<T>), object_pool_alignment);
+	}
+
+	static constexpr size_t memory_pool_size()
+	{
+		if(is_large_object())
+		{
+			return align_up(size_of_inline_segment() + size_of_chunk() * 24, PAGE_SIZE); 
+		}
+		else
+			return default_pool_size;
+	}
+
 	constexpr size_t number_of_objects()
 	{
-		return memory_pool_size() / size_of_chunk();
+		return (memory_pool_size() - size_of_inline_segment()) / size_of_chunk();
 	}
 
 	std::pair<memory_chunk<T> *, memory_chunk<T> *> setup_chunks()
 	{
 		memory_chunk<T> *prev = nullptr;
-		memory_chunk<T> *curr = static_cast<memory_chunk<T> *>(mmap_segment);
+		memory_chunk<T> *curr = reinterpret_cast<memory_chunk<T> *>((unsigned char *) mmap_segment + size_of_inline_segment());
+		auto first = curr;
 		auto nr_objs = number_of_objects();
 
 		while(nr_objs--)
 		{
 			curr->segment = this;
+#ifdef OBJECT_CANARY
+			curr->object_canary = OBJECT_CANARY;
+#endif
 			curr->next = nullptr;
 			if(prev)	prev->next = curr;
 
@@ -109,7 +142,7 @@ public:
 			curr = reinterpret_cast<memory_chunk<T> *>(reinterpret_cast<unsigned char *>(curr) + size_of_chunk());
 		}
 
-		return std::pair<memory_chunk<T> *, memory_chunk<T> *>(static_cast<memory_chunk<T> *>(mmap_segment), prev);
+		return std::pair<memory_chunk<T> *, memory_chunk<T> *>(first, prev);
 	}
 
 	bool empty()
@@ -134,8 +167,39 @@ class memory_pool
 private:
 	memory_chunk<T> *free_chunk_head, *free_chunk_tail;
 	std::mutex lock;
-	std::list<memory_pool_segment<T> > segment_list;
+	memory_pool_segment<T> *segment_head, *segment_tail;
 	size_t nr_objects;
+
+	void append_segment(memory_pool_segment<T> *seg)
+	{
+		if(!segment_head)
+		{
+			segment_head = segment_tail = seg;
+		}
+		else
+		{
+			segment_tail->next = seg;
+			seg->prev = segment_tail;
+			segment_tail = seg;
+		}
+	}
+
+	void remove_segment(memory_pool_segment<T> *seg)
+	{
+		if(seg->prev)
+		{
+			seg->prev->next = seg->next;
+		}
+		else
+			segment_head = seg->next;
+		
+		if(seg->next)
+			seg->next->prev = seg->prev;
+		else
+			segment_tail = seg->prev;
+
+		seg->~memory_pool_segment<T>();
+	}
 
 	bool expand_pool()
 	{
@@ -151,13 +215,15 @@ private:
 
 		//std::cout << "Added " << new_mmap_region << " size " << allocation_size << "\n";
 	
-		segment_list.push_back(std::move(seg));
+		memory_pool_segment<T> &mmap_seg = *static_cast<memory_pool_segment<T> *>(new_mmap_region);
+		mmap_seg = std::move(seg);
 
-		auto pair = segment_list.back().setup_chunks();
+		auto pair = mmap_seg.setup_chunks();
 		free_chunk_head = pair.first;
 		free_chunk_tail = pair.second;
 
-		/* TODO: Test for failure */
+		append_segment(&mmap_seg);
+
 		return true;
 	}
 
@@ -176,7 +242,7 @@ private:
 		return c;
 	}
 
-	void free_list_remove_chunks(memory_pool_segment<T> *seg)
+	void free_list_purge_segment_chunks(memory_pool_segment<T> *seg)
 	{
 		//std::cout << "Removing chunks\n";
 		auto l = free_chunk_head;
@@ -186,7 +252,7 @@ private:
 			//std::cout << "Hello " << l << "\n";
 			if(l->segment == seg)
 			{
-				//std::cout << "Removing daldmchunk " << l << "\n";
+				//std::cout << "Removing chunk " << l << "\n";
 				if(prev)
 					prev->next = l->next;
 				else
@@ -199,23 +265,58 @@ private:
 			l = l->next;
 		}
 	}
+
+	void append_chunk_tail(memory_chunk<T> *chunk)
+	{
+		if(!free_chunk_tail)
+		{
+			free_chunk_head = free_chunk_tail = chunk;
+		}
+		else
+		{
+			free_chunk_tail->next = chunk;
+			free_chunk_tail = chunk;
+			assert(free_chunk_head != nullptr);
+		}
+	}
+
+	void append_chunk_head(memory_chunk<T> *chunk)
+	{
+		if(!free_chunk_head)
+		{
+			free_chunk_head = free_chunk_tail = chunk;
+		}
+		else
+		{
+			auto curr_head = free_chunk_head;
+			free_chunk_head = chunk;
+			free_chunk_head->next = curr_head;
+			assert(free_chunk_tail != nullptr);
+		}
+	}
+
+	void purge_segment(memory_pool_segment<T> *segment)
+	{
+		if(segment->empty())
+		{
+			/* We can still have free objects on the free list. Remove them. */
+			free_list_purge_segment_chunks(segment);
+			remove_segment(segment);
+		}
+	}
+
 public:
 	size_t used_objects;
 
-	memory_pool() : free_chunk_head{nullptr}, free_chunk_tail{nullptr}, lock{}, segment_list{}, nr_objects{0}, used_objects{0} {}
+	memory_pool() : free_chunk_head{nullptr}, free_chunk_tail{nullptr}, lock{}, segment_head{}, segment_tail{},
+			nr_objects{0}, used_objects{0} {}
 
 	void print_segments()
 	{
-		//std::cout << "List size: " << segment_list.size() << "\n";
-		for(auto &s : segment_list)
-		{
-			//std::cout << "Segment: " << s.get_mmap_segment() << " Used objs: " << s.used_objs << "\n";
-		}
 	}
 
 	~memory_pool()
 	{
-		print_segments();
 		assert(used_objects == 0);
 	}
 
@@ -227,7 +328,7 @@ public:
 		{
 			if(!expand_pool())
 			{
-				//std::cout << "mmap failed after " << segment_list.size() << "\n";
+				//std::cout << "mmap failed\n";
 				return nullptr;
 			}
 		}
@@ -241,6 +342,10 @@ public:
 		return_chunk->segment->used_objs++;
 		used_objects++;
 
+#ifdef OBJECT_CANARY
+		assert(return_chunk->object_canary == OBJECT_CANARY);
+#endif
+
 		return reinterpret_cast<T *>(return_chunk + 1);
 	}
 
@@ -251,27 +356,34 @@ public:
 		std::scoped_lock guard{lock};
 
 		chunk->next = nullptr;
+#ifdef OBJECT_CANARY
+		assert(chunk->object_canary == OBJECT_CANARY);
+#endif
 
-		if(!free_chunk_tail)
-		{
-			free_chunk_head = free_chunk_tail = chunk;
-		}
-		else
-		{
-			free_chunk_tail->next = chunk;
-			free_chunk_tail = chunk;
-			assert(free_chunk_head != nullptr);
-		}
+#ifndef OBJECT_POOL_ALLOCATE_WARM_CACHE
+		append_chunk_tail(chunk);
+#else
+		append_chunk_head(chunk);
+#endif
 
 		used_objects--;
 		chunk->segment->used_objs--;
 
-		if(chunk->segment->empty())
+#ifndef OBJECT_POOL_DEFER_UNMAP
+		purge_segment(chunk->segment);
+#endif
+	}
+
+
+	void purge()
+	{
+		auto s = segment_head;
+
+		while(s)
 		{
-			/* We can still have free objects on the free list. Remove them. */
-			free_list_remove_chunks(chunk->segment);
-			auto &seg = *chunk->segment;
-			segment_list.remove(seg);
+			auto next = s->next;
+			purge_segment(s);
+			s = next;
 		}
 	}
 };
@@ -305,6 +417,8 @@ int main(int argc, char **)
 		pool.free(p);
 		p = nullptr;
 	}
+
+	pool.purge();
 
 	//std::cout << "Used objects: " << pool.used_objects << "\n";
 	return 0;
