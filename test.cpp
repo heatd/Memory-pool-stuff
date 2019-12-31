@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <sys/user.h>
 #include <cassert>
+#include <utility>
 
 static constexpr size_t object_pool_alignment = 16UL;
 
@@ -41,10 +42,13 @@ public:
 		if(mmap_segment != nullptr)
 		{
 			assert(used_objs == 0);
-			std::cout << "Freeing segment " << mmap_segment << "\n";
+			//std::cout << "Freeing segment " << mmap_segment << "\n";
 			munmap(mmap_segment, size);
 		}
 	}
+
+	memory_pool_segment(const memory_pool_segment &rhs) = delete;
+	memory_pool_segment& operator=(const memory_pool_segment &rhs) = delete;
 
 	memory_pool_segment(memory_pool_segment&& rhs)
 	{
@@ -83,13 +87,13 @@ public:
 	{
 		return align_up(sizeof(T), object_pool_alignment) + sizeof(memory_chunk<T>);
 	}
-	
+
 	constexpr size_t number_of_objects()
 	{
 		return memory_pool_size() / size_of_chunk();
 	}
 
-	memory_chunk<T> *setup_chunks()
+	std::pair<memory_chunk<T> *, memory_chunk<T> *> setup_chunks()
 	{
 		memory_chunk<T> *prev = nullptr;
 		memory_chunk<T> *curr = static_cast<memory_chunk<T> *>(mmap_segment);
@@ -105,7 +109,7 @@ public:
 			curr = reinterpret_cast<memory_chunk<T> *>(reinterpret_cast<unsigned char *>(curr) + size_of_chunk());
 		}
 
-		return static_cast<memory_chunk<T> *>(mmap_segment);
+		return std::pair<memory_chunk<T> *, memory_chunk<T> *>(static_cast<memory_chunk<T> *>(mmap_segment), prev);
 	}
 
 	bool empty()
@@ -135,20 +139,24 @@ private:
 
 	bool expand_pool()
 	{
-		std::cout << "Expanding pool.\n";
+		//std::cout << "Expanding pool.\n";
 		auto allocation_size = memory_pool_segment<T>::memory_pool_size();
 		void *new_mmap_region = mmap(nullptr, allocation_size, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 		if(!new_mmap_region)
 			return false;
-		
-		memory_pool_segment<T> seg{new_mmap_region, allocation_size};
 
-		free_chunk_head = free_chunk_tail = seg.setup_chunks();
+		memory_pool_segment<T> seg{new_mmap_region, allocation_size};
 
 		nr_objects += seg.number_of_objects();
 
+		//std::cout << "Added " << new_mmap_region << " size " << allocation_size << "\n";
+	
 		segment_list.push_back(std::move(seg));
-		
+
+		auto pair = segment_list.back().setup_chunks();
+		free_chunk_head = pair.first;
+		free_chunk_tail = pair.second;
+
 		/* TODO: Test for failure */
 		return true;
 	}
@@ -167,17 +175,41 @@ private:
 		memory_chunk<T> *c = reinterpret_cast<memory_chunk<T> *>(ptr) - 1;
 		return c;
 	}
+
+	void free_list_remove_chunks(memory_pool_segment<T> *seg)
+	{
+		//std::cout << "Removing chunks\n";
+		auto l = free_chunk_head;
+		memory_chunk<T> *prev = nullptr;
+		while(l)
+		{
+			//std::cout << "Hello " << l << "\n";
+			if(l->segment == seg)
+			{
+				//std::cout << "Removing daldmchunk " << l << "\n";
+				if(prev)
+					prev->next = l->next;
+				else
+					free_chunk_head = l->next;
+				
+				if(!l->next)
+					free_chunk_tail = prev;
+			}
+
+			l = l->next;
+		}
+	}
 public:
 	size_t used_objects;
 
 	memory_pool() : free_chunk_head{nullptr}, free_chunk_tail{nullptr}, lock{}, segment_list{}, nr_objects{0}, used_objects{0} {}
-	
+
 	void print_segments()
 	{
-		std::cout << "List size: " << segment_list.size() << "\n";
+		//std::cout << "List size: " << segment_list.size() << "\n";
 		for(auto &s : segment_list)
 		{
-			std::cout << "Segment: " << s.get_mmap_segment() << " Used objs: " << s.used_objs << "\n";
+			//std::cout << "Segment: " << s.get_mmap_segment() << " Used objs: " << s.used_objs << "\n";
 		}
 	}
 
@@ -195,13 +227,13 @@ public:
 		{
 			if(!expand_pool())
 			{
-				std::cout << "mmap failed after " << segment_list.size() << "\n";
+				//std::cout << "mmap failed after " << segment_list.size() << "\n";
 				return nullptr;
 			}
 		}
 
 		auto return_chunk = free_chunk_head;
-	
+
 		free_chunk_head = free_chunk_head->next;
 
 		if(!free_chunk_head)	free_chunk_tail = nullptr;
@@ -215,7 +247,10 @@ public:
 	void free(T *ptr)
 	{
 		auto chunk = ptr_to_chunk(ptr);
+		//std::cout << "Removing chunk " << chunk << "\n";
 		std::scoped_lock guard{lock};
+
+		chunk->next = nullptr;
 
 		if(!free_chunk_tail)
 		{
@@ -225,6 +260,7 @@ public:
 		{
 			free_chunk_tail->next = chunk;
 			free_chunk_tail = chunk;
+			assert(free_chunk_head != nullptr);
 		}
 
 		used_objects--;
@@ -232,7 +268,10 @@ public:
 
 		if(chunk->segment->empty())
 		{
-			segment_list.remove(*chunk->segment);
+			/* We can still have free objects on the free list. Remove them. */
+			free_list_remove_chunks(chunk->segment);
+			auto &seg = *chunk->segment;
+			segment_list.remove(seg);
 		}
 	}
 };
@@ -258,7 +297,7 @@ int main(int argc, char **)
 	{
 		auto p = pool.allocate();
 		vec.push_back(p);
-		std::cout << "Allocated " << p << "\n";
+		//std::cout << "Allocated " << p << "\n";
 	}
 
 	for(auto &p : vec)
@@ -266,7 +305,7 @@ int main(int argc, char **)
 		pool.free(p);
 		p = nullptr;
 	}
-	
-	std::cout << "Used objects: " << pool.used_objects << "\n";
+
+	//std::cout << "Used objects: " << pool.used_objects << "\n";
 	return 0;
 }
